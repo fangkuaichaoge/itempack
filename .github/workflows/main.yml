@@ -32,10 +32,16 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
-        with:
-          packages: |
-            platforms;android-26
-            ndk;${{ env.NDK_VERSION }}
+
+      - name: Install NDK via sdkmanager
+        run: |
+          set -e
+          # Accept all licenses (sdkmanager requires explicit acceptance)
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          # Install NDK + platform as separate sdkmanager invocations to avoid
+          # multi-line YAML quoting issues with setup-android's "packages" input.
+          sdkmanager "ndk;${{ env.NDK_VERSION }}"
+          sdkmanager "platforms;${{ env.ANDROID_PLATFORM }}"
 
       - name: Locate NDK
         id: ndk
