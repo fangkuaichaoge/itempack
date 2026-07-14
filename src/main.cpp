@@ -21,7 +21,10 @@
 #include <unistd.h>
 #include <dlfcn.h>
 
-#include "pl/Gloss.h"
+// Use preloader-android's PUBLIC API only (pl/memory/Hook.hpp is exported via
+// target_include_directories(preloader PUBLIC include)). pl/Gloss.h is PRIVATE
+// and must not be included directly.
+#include "pl/memory/Hook.hpp"
 
 #include "ImGui/imgui.h"
 #include "ImGui/backends/imgui_impl_opengl3.h"
@@ -61,7 +64,9 @@ static void* resolve(const char* sig, const char* name) {
 // ---------------------------------------------------------------------------
 __attribute__((constructor))
 static void mod_init() {
-    GlossInit(true);
+    // GlossInit() was removed from preloader-android's public API; the hook
+    // engine self-initialises on first pl::memory::hook() call. itempack uses
+    // its own ip:: hook helpers, so no explicit init is needed here.
     LOGI("mod_init starting (itempack for libminecraftpe 1.26.30)");
 
     // ---- Signature resolution (wildcard patterns for 1.26.30) ----
@@ -477,11 +482,18 @@ static bool OnTouchCallback(int action, int pointerId, float x, float y) {
 
 static void* imgui_thread(void*) {
     sleep(3); // wait for game libs to load
-    GlossInit(true);
-    GHandle hegl = GlossOpen("libEGL.so");
-    if (hegl) {
-        void* swap = (void*)GlossSymbol(hegl, "eglSwapBuffers", nullptr);
-        if (swap) GlossHook(swap, (void*)hook_eglswapbuffers, (void**)&orig_eglswapbuffers);
+    // eglSwapBuffers hook via standard dlsym + preloader's PUBLIC hook API.
+    // (Previously used GlossOpen/GlossSymbol/GlossHook from pl/Gloss.h, but
+    //  pl/Gloss.h is a PRIVATE header of preloader-android and not exported.)
+    void* egl = dlopen("libEGL.so", RTLD_NOW);
+    if (egl) {
+        void* swap = dlsym(egl, "eglSwapBuffers");
+        if (swap) {
+            // pl::memory::hook self-initialises GlossHook on first call.
+            pl::memory::hook(swap,
+                             (pl::memory::FuncPtr)hook_eglswapbuffers,
+                             (pl::memory::FuncPtr*)&orig_eglswapbuffers);
+        }
     }
 
     void* preloaderLib = dlopen("libpreloader.so", RTLD_NOW);

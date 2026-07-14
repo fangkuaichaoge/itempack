@@ -17,11 +17,22 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <vector>
 #include <android/log.h>
+#include <dlfcn.h>
+#include <link.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <elf.h>
 
-#include "pl/Gloss.h"
-#include "pl/Signature.h"
+// We intentionally do NOT include pl/Gloss.h or pl/Signature.h:
+//  - pl/Gloss.h is a PRIVATE header of preloader-android (only in src/pl/,
+//    not exported via target_include_directories PUBLIC).
+//  - pl/Signature.h does not exist in current preloader-android; the modern
+//    API is pl::memory::resolveSignature() in pl/memory/Signature.hpp.
+// To stay self-contained, we implement section lookup + mprotect locally.
 
 namespace ip {
 
@@ -31,24 +42,88 @@ inline constexpr const char* MCPE_LIB = "libminecraftpe.so";
 #define IP_LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "[itempack]", __VA_ARGS__)
 
 // ---------------------------------------------------------------------------
-//  Section helpers
+//  Section helpers (self-contained, no pl:: dependency)
 // ---------------------------------------------------------------------------
+// Locate a loaded shared library's load base + path via dl_iterate_phdr.
+struct LibInfo { uintptr_t base; const char* path; };
+inline int findLibCb(dl_phdr_info* info, size_t /*sz*/, void* data) {
+    auto* out = static_cast<LibInfo*>(data);
+    if (!info->dlpi_name) return 0;
+    // Match by basename (e.g. "libminecraftpe.so" matches any path ending
+    // with that name).
+    const char* name = info->dlpi_name;
+    const char* slash = strrchr(name, '/');
+    const char* base = slash ? slash + 1 : name;
+    if (strcmp(base, out->path) == 0) {
+        out->base = info->dlpi_addr;
+        out->path = name; // full path now
+        return 1;
+    }
+    return 0;
+}
+
+inline uintptr_t getLibBase(const char* libBasename) {
+    LibInfo info{0, libBasename};
+    dl_iterate_phdr(findLibCb, &info);
+    return info.base;
+}
+
+// Resolve a section's runtime address + size by parsing the ELF section
+// headers of the loaded library. Returns 0 on failure.
 inline uintptr_t getSection(const char* lib, const char* section, size_t* outSize) {
-    return GlossGetLibSection(lib, section, outSize);
+    if (outSize) *outSize = 0;
+    LibInfo info{0, lib};
+    dl_iterate_phdr(findLibCb, &info);
+    if (!info.base || !info.path) {
+        IP_LOGE("getSection: library '%s' not loaded", lib);
+        return 0;
+    }
+    // Open the on-disk .so to read section headers (they are not mapped at
+    // runtime, only program headers are). This is cheap and only runs during
+    // mod init / scanning.
+    FILE* fp = fopen(info.path, "rb");
+    if (!fp) {
+        IP_LOGE("getSection: cannot open '%s'", info.path);
+        return 0;
+    }
+    Elf64_Ehdr ehdr;
+    if (fread(&ehdr, sizeof(ehdr), 1, fp) != 1) { fclose(fp); return 0; }
+    if (memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0) { fclose(fp); return 0; }
+
+    std::vector<Elf64_Shdr> shdrs(ehdr.e_shnum);
+    fseek(fp, ehdr.e_shoff, SEEK_SET);
+    if (fread(shdrs.data(), sizeof(Elf64_Shdr), ehdr.e_shnum, fp) != ehdr.e_shnum) {
+        fclose(fp); return 0;
+    }
+    // Read the .shstrtab to get section names.
+    if (ehdr.e_shstrndx >= ehdr.e_shnum) { fclose(fp); return 0; }
+    Elf64_Shdr& strtab = shdrs[ehdr.e_shstrndx];
+    std::vector<char> strdata(strtab.sh_size);
+    fseek(fp, strtab.sh_offset, SEEK_SET);
+    if (fread(strdata.data(), 1, strtab.sh_size, fp) != strtab.sh_size) {
+        fclose(fp); return 0;
+    }
+    fclose(fp);
+
+    for (auto const& s : shdrs) {
+        const char* name = strdata.data() + s.sh_name;
+        if (strcmp(name, section) == 0) {
+            // sh_addr is the virtual address relative to the load base.
+            if (outSize) *outSize = s.sh_size;
+            return info.base + s.sh_addr;
+        }
+    }
+    IP_LOGE("getSection: section '%s' not found in '%s'", section, lib);
+    return 0;
 }
 
-inline void unprotect(uintptr_t addr, size_t len) {
-    Unprotect(addr, len);
-}
-
-// ---------------------------------------------------------------------------
-//  1. pl::Signature resolver (placeholder patterns - update per version)
-// ---------------------------------------------------------------------------
-inline void* resolveSignature(const char* sig, const char* name, const char* lib = MCPE_LIB) {
-    uintptr_t addr = pl::signature::pl_resolve_signature(sig, lib);
-    if (!addr) { IP_LOGE("sig not found: %s", name); return nullptr; }
-    IP_LOGI("found %s @ 0x%lx", name, (unsigned long)addr);
-    return reinterpret_cast<void*>(addr);
+inline bool unprotect(uintptr_t addr, size_t len) {
+    // Round to page boundary.
+    long pagesz = sysconf(_SC_PAGESIZE);
+    uintptr_t pageStart = addr & ~(uintptr_t)(pagesz - 1);
+    uintptr_t pageEnd   = (addr + len + pagesz - 1) & ~(uintptr_t)(pagesz - 1);
+    return mprotect((void*)pageStart, pageEnd - pageStart,
+                    PROT_READ | PROT_WRITE | PROT_EXEC) == 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -123,6 +198,18 @@ inline uintptr_t scanPatternInSection(const char* pattern, const char* section =
     uintptr_t base = getSection(lib, section, &sz);
     if (!base || !sz) return 0;
     return scanPattern(base, sz, pattern);
+}
+
+// ---------------------------------------------------------------------------
+//  Signature resolver
+//  Uses our own wildcard pattern scanner (no pl:: dependency). The pattern
+//  format is "AA BB ?? CC" where "??" matches any byte.
+// ---------------------------------------------------------------------------
+inline void* resolveSignature(const char* sig, const char* name, const char* lib = MCPE_LIB) {
+    uintptr_t addr = scanPatternInSection(sig, ".text", lib);
+    if (!addr) { IP_LOGE("sig not found: %s", name); return nullptr; }
+    IP_LOGI("found %s @ 0x%lx", name, (unsigned long)addr);
+    return reinterpret_cast<void*>(addr);
 }
 
 // ---------------------------------------------------------------------------
