@@ -56,7 +56,10 @@ inline constexpr int kTotalDisplaySlots    = 36; // hotbar(9) + main(27) = 9x4 g
 inline bool isValidVfIndex(int idx) { return idx >= 0 && idx < 0x400; }
 
 // Validate a pointer looks plausible (non-null, in user address space).
-inline bool plausiblePtr(const void* p) {
+// Templated so it accepts both object pointers and function pointers
+// (C++ forbids implicit function-pointer-to-void* conversion).
+template <typename T>
+inline bool plausiblePtr(T p) {
     auto v = reinterpret_cast<uintptr_t>(p);
     return v > 0x1000 && v < 0x7FFFFFFFFFFF;
 }
